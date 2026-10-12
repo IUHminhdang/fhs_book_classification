@@ -395,7 +395,7 @@ def _run_bert_family(model_name: str, train_texts: pd.Series, val_texts: pd.Seri
             per_device_train_batch_size=4,
             per_device_eval_batch_size=4,
             num_train_epochs=1,
-            evaluation_strategy="epoch",
+            eval_strategy="epoch",
             save_strategy="epoch",
             logging_steps=50,
             load_best_model_at_end=True,
