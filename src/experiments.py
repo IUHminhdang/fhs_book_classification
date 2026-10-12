@@ -19,6 +19,11 @@ from .config import EXPERIMENTS, RunConfig, TARGET_COLUMN
 from .data_validation import load_split_csv, validate_dataset
 from .text_utils import combine_text_fields, segment_vietnamese_text
 
+FASTTEXT_EPOCHS = 15
+RNN_EPOCHS = 10
+RNN_EARLY_STOPPING_PATIENCE = 3
+TRANSFORMER_EPOCHS = 5
+
 
 def _ensure_split_compatibility(data_dir: str | Path) -> dict:
     splits = validate_dataset(data_dir, required_splits=("train", "val", "test"))
@@ -81,6 +86,13 @@ def _serialize_result(result: Dict[str, Any]) -> Dict[str, Any]:
     if isinstance(result.get("metrics"), dict):
         result["metrics"] = result["metrics"]
     return result
+
+
+def _class_weight_metadata(y_train: pd.Series, labels: list[str]) -> tuple[list[float], dict[str, int]]:
+    counts = y_train.astype(str).value_counts()
+    total = len(y_train)
+    weights = [float(total / (len(labels) * max(int(counts.get(label, 0)), 1))) for label in labels]
+    return weights, {label: int(counts.get(label, 0)) for label in labels}
 
 
 def _run_tfidf_model(model_name: str, train_texts: pd.Series, val_texts: pd.Series, test_texts: pd.Series, y_train: pd.Series, y_val: pd.Series, y_test: pd.Series, labels: list[str]) -> Dict[str, Any]:
@@ -173,7 +185,7 @@ def _run_fasttext_model(model_name: str, train_texts: pd.Series, val_texts: pd.S
     token_corpus = [segment_vietnamese_text(text).split() for text in train_texts.astype(str)]
     model = FastText(vector_size=100, window=5, min_count=2, workers=1, sg=1)
     model.build_vocab(token_corpus)
-    for _ in tqdm(range(10), desc="FastText training", unit="epoch"):
+    for _ in tqdm(range(FASTTEXT_EPOCHS), desc="FastText training", unit="epoch"):
         model.train(token_corpus, total_examples=len(token_corpus), epochs=1)
 
     max_length = 128
@@ -234,14 +246,20 @@ def _run_fasttext_model(model_name: str, train_texts: pd.Series, val_texts: pd.S
         torch.tensor([label_to_id[label] for label in y_test.astype(str)], dtype=torch.long),
     )
     loader = DataLoader(train_dataset, batch_size=64, shuffle=True)
-    criterion = nn.CrossEntropyLoss()
+    class_weights, class_counts = _class_weight_metadata(y_train, labels)
+    criterion = nn.CrossEntropyLoss(
+        weight=torch.tensor(class_weights, dtype=torch.float32, device=device)
+    )
     optimizer = torch.optim.Adam(classifier.parameters(), lr=1e-3)
     training_start = time.perf_counter()
     history = []
+    best_val_loss = float("inf")
+    epochs_without_improvement = 0
+    best_state = None
 
     classifier.train()
-    for epoch in range(5):
-        progress = tqdm(loader, desc=f"{model_name} epoch {epoch + 1}/5", unit="batch")
+    for epoch in range(RNN_EPOCHS):
+        progress = tqdm(loader, desc=f"{model_name} epoch {epoch + 1}/{RNN_EPOCHS}", unit="batch")
         epoch_loss = 0.0
         batch_count = 0
         for inputs, lengths, targets in progress:
@@ -269,7 +287,18 @@ def _run_fasttext_model(model_name: str, train_texts: pd.Series, val_texts: pd.S
                 "val_loss": val_loss / max(val_batches, 1),
             }
         )
+        if history[-1]["val_loss"] < best_val_loss:
+            best_val_loss = history[-1]["val_loss"]
+            epochs_without_improvement = 0
+            best_state = {key: value.detach().cpu().clone() for key, value in classifier.state_dict().items()}
+        else:
+            epochs_without_improvement += 1
+            if epochs_without_improvement >= RNN_EARLY_STOPPING_PATIENCE:
+                tqdm.write(f"Early stopping at epoch {epoch + 1}; best validation loss={best_val_loss:.4f}")
+                break
         classifier.train()
+    if best_state is not None:
+        classifier.load_state_dict(best_state)
     training_time = time.perf_counter() - training_start
 
     def predict(dataset: TensorDataset) -> tuple[np.ndarray, float]:
@@ -299,6 +328,9 @@ def _run_fasttext_model(model_name: str, train_texts: pd.Series, val_texts: pd.S
         "device": str(device),
         "parameter_count": sum(parameter.numel() for parameter in classifier.parameters()),
         "history": history,
+        "class_counts": class_counts,
+        "class_weights": class_weights,
+        "loss": "weighted_cross_entropy",
     }
 
 
@@ -339,43 +371,55 @@ def _run_phobert_nli_vi(train_texts: pd.Series, val_texts: pd.Series, test_texts
         }
 
     try:
-        from transformers import pipeline
-    except Exception as exc:  # pragma: no cover
-        return {"model_id": "phobert_nli_vi", "status": "dependency_missing", "notes": f"transformers pipeline unavailable: {exc}"}
+        import numpy as np
+        import torch
+        from transformers import AutoModelForSequenceClassification, AutoTokenizer
 
-    classifier = pipeline("zero-shot-classification", model=model_id, tokenizer=model_id, device=-1)
-    candidate_labels = labels
-    inference_start = time.perf_counter()
-    try:
-        test_scores = [
-            classifier(
-                text,
-                candidate_labels,
-                multi_label=False,
-                truncation=True,
-                max_length=256,
-            )
-            for text in tqdm(test_texts.astype(str), desc="Zero-shot test", unit="text")
-        ]
-        predicted = [pred["labels"][0] for pred in test_scores]
-        val_scores = [
-            classifier(
-                text,
-                candidate_labels,
-                multi_label=False,
-                truncation=True,
-                max_length=256,
-            )
-            for text in tqdm(val_texts.astype(str), desc="Zero-shot validation", unit="text")
-        ]
+        tokenizer = AutoTokenizer.from_pretrained(model_id)
+        model = AutoModelForSequenceClassification.from_pretrained(model_id)
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        model.to(device)
+        model.eval()
+        model_limit = int(getattr(model.config, "max_position_embeddings", 256))
+        max_length = max(32, min(254, model_limit - 2))
+        label_map = getattr(model.config, "label2id", {}) or {}
+        entailment_id = next(
+            (int(index) for name, index in label_map.items() if "entail" in str(name).lower()),
+            None,
+        )
+        if entailment_id is None:
+            entailment_id = 0
+        hypothesis_template = "Nội dung này thuộc thể loại {}."
+
+        def predict(texts: pd.Series, description: str) -> tuple[list[str], float]:
+            predictions = []
+            start = time.perf_counter()
+            for text in tqdm(texts.astype(str), desc=description, unit="text"):
+                hypotheses = [hypothesis_template.format(label) for label in labels]
+                encoded = tokenizer(
+                    [text] * len(hypotheses),
+                    hypotheses,
+                    truncation="only_first",
+                    max_length=max_length,
+                    padding=True,
+                    return_tensors="pt",
+                )
+                encoded = {key: value.to(device) for key, value in encoded.items()}
+                with torch.no_grad():
+                    logits = model(**encoded).logits
+                scores = torch.softmax(logits[:, entailment_id], dim=0).detach().cpu().numpy()
+                predictions.append(labels[int(np.argmax(scores))])
+            return predictions, time.perf_counter() - start
+
+        predicted, test_time = predict(test_texts, "Zero-shot test")
+        val_pred, val_time = predict(val_texts, "Zero-shot validation")
+        inference_time = test_time + val_time
     except Exception as exc:
         return {
             "model_id": "phobert_nli_vi",
             "status": "inference_failed",
-            "notes": f"Zero-shot inference failed after truncation to 256 tokens: {exc}",
+            "notes": f"Zero-shot inference failed after safe pair truncation to {max_length if 'max_length' in locals() else 'model limit'} tokens: {exc}",
         }
-    val_pred = [pred["labels"][0] for pred in val_scores]
-    inference_time = time.perf_counter() - inference_start
     val_metrics = _compute_metrics(y_val.astype(str), pd.Series(val_pred), labels)
     test_metrics = _compute_metrics(y_test.astype(str), pd.Series(predicted), labels)
     return {
@@ -385,6 +429,8 @@ def _run_phobert_nli_vi(train_texts: pd.Series, val_texts: pd.Series, test_texts
         "labels": labels,
         "inference_time": inference_time,
         "fps": float(len(test_texts) / inference_time) if inference_time > 0 else None,
+        "device": str(device),
+        "max_length": max_length,
     }
 
 
@@ -392,6 +438,7 @@ def _run_bert_family(model_name: str, train_texts: pd.Series, val_texts: pd.Seri
     try:
         from transformers import AutoTokenizer, AutoModelForSequenceClassification, Trainer, TrainingArguments
         from torch.utils.data import Dataset
+        import torch
     except Exception as exc:  # pragma: no cover
         return {"model_id": model_name, "status": "dependency_missing", "notes": f"transformers unavailable: {exc}"}
 
@@ -424,11 +471,24 @@ def _run_bert_family(model_name: str, train_texts: pd.Series, val_texts: pd.Seri
         train_encoded = EncodedTextDataset(train_texts, y_train)
         val_encoded = EncodedTextDataset(val_texts, y_val)
         test_encoded = EncodedTextDataset(test_texts, y_test)
+        class_weights, class_counts = _class_weight_metadata(y_train, labels)
+
+        class WeightedTrainer(Trainer):
+            def compute_loss(self, model, inputs, return_outputs=False, num_items_in_batch=None):
+                labels_tensor = inputs.pop("labels")
+                outputs = model(**inputs)
+                loss = torch.nn.functional.cross_entropy(
+                    outputs.logits,
+                    labels_tensor,
+                    weight=torch.tensor(class_weights, dtype=torch.float32, device=outputs.logits.device),
+                )
+                return (loss, outputs) if return_outputs else loss
+
         training_args = TrainingArguments(
             output_dir=str(Path("outputs") / "runs" / model_name),
             per_device_train_batch_size=4,
             per_device_eval_batch_size=4,
-            num_train_epochs=1,
+            num_train_epochs=TRANSFORMER_EPOCHS,
             eval_strategy="epoch",
             save_strategy="epoch",
             logging_steps=50,
@@ -445,7 +505,7 @@ def _run_bert_family(model_name: str, train_texts: pd.Series, val_texts: pd.Seri
             preds = np.argmax(logits, axis=-1)
             return {"accuracy": (preds == labels).mean()}
 
-        trainer = Trainer(
+        trainer = WeightedTrainer(
             model=model,
             args=training_args,
             train_dataset=train_encoded,
@@ -483,6 +543,9 @@ def _run_bert_family(model_name: str, train_texts: pd.Series, val_texts: pd.Seri
             "inference_time": inference_time,
             "fps": float(len(test_texts) / inference_time) if inference_time > 0 else None,
             "history": history,
+            "class_counts": class_counts,
+            "class_weights": class_weights,
+            "loss": "weighted_cross_entropy",
         }
     except Exception as exc:  # pragma: no cover - model availability is reported explicitly
         return {"model_id": model_name, "status": "model_unavailable", "notes": f"Could not initialize {model_id}: {exc}"}
@@ -540,6 +603,15 @@ def run_experiment(experiment_id: str, data_dir: str | Path, output_dir: str | P
     result["resume_supported"] = True
     result["notes"] = result.get("notes", "")
     result["input_columns"] = ["title", "description"]
+    class_weights, class_counts = _class_weight_metadata(y_train, labels)
+    result.setdefault("class_counts", class_counts)
+    result.setdefault("class_weights", class_weights)
+    result["training_config"] = {
+        "fasttext_epochs": FASTTEXT_EPOCHS,
+        "rnn_epochs": RNN_EPOCHS,
+        "rnn_early_stopping_patience": RNN_EARLY_STOPPING_PATIENCE,
+        "transformer_epochs": TRANSFORMER_EPOCHS,
+    }
     output_path = output_dir / "results" / f"{experiment_id}.json"
     output_path.parent.mkdir(parents=True, exist_ok=True)
     with open(output_path, "w", encoding="utf-8") as handle:
