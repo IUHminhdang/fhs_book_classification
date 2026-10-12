@@ -323,9 +323,15 @@ def _run_phobert_nli_vi(train_texts: pd.Series, val_texts: pd.Series, test_texts
     classifier = pipeline("zero-shot-classification", model=model_id, tokenizer=model_id, device=-1)
     candidate_labels = labels
     inference_start = time.perf_counter()
-    test_scores = [classifier(text, candidate_labels, multi_label=False) for text in test_texts.astype(str).tolist()]
+    test_scores = [
+        classifier(text, candidate_labels, multi_label=False)
+        for text in tqdm(test_texts.astype(str), desc="Zero-shot test", unit="text")
+    ]
     predicted = [pred["labels"][0] for pred in test_scores]
-    val_scores = [classifier(text, candidate_labels, multi_label=False) for text in val_texts.astype(str).tolist()]
+    val_scores = [
+        classifier(text, candidate_labels, multi_label=False)
+        for text in tqdm(val_texts.astype(str), desc="Zero-shot validation", unit="text")
+    ]
     val_pred = [pred["labels"][0] for pred in val_scores]
     inference_time = time.perf_counter() - inference_start
     val_metrics = _compute_metrics(y_val.astype(str), pd.Series(val_pred), labels)
@@ -373,6 +379,7 @@ def _run_bert_family(model_name: str, train_texts: pd.Series, val_texts: pd.Seri
             metric_for_best_model="eval_loss",
             remove_unused_columns=False,
             report_to=[],
+            disable_tqdm=False,
         )
 
         def compute_metrics(eval_pred):
@@ -388,14 +395,26 @@ def _run_bert_family(model_name: str, train_texts: pd.Series, val_texts: pd.Seri
             eval_dataset=val_encoded,
             compute_metrics=compute_metrics,
         )
+        training_start = time.perf_counter()
         trainer.train()
+        training_time = time.perf_counter() - training_start
+        inference_start = time.perf_counter()
         val_pred = trainer.predict(val_encoded).predictions.argmax(-1)
         test_pred = trainer.predict(test_encoded).predictions.argmax(-1)
+        inference_time = time.perf_counter() - inference_start
         val_labels = y_val.astype(str).tolist()
         test_labels = y_test.astype(str).tolist()
         val_metrics = _compute_metrics(pd.Series(val_labels), pd.Series([id_to_label.get(int(v), str(v)) for v in val_pred]), labels)
         test_metrics = _compute_metrics(pd.Series(test_labels), pd.Series([id_to_label.get(int(v), str(v)) for v in test_pred]), labels)
-        return {"model_id": model_name, "status": "completed", "metrics": {"val": val_metrics, "test": test_metrics}, "labels": labels}
+        return {
+            "model_id": model_name,
+            "status": "completed",
+            "metrics": {"val": val_metrics, "test": test_metrics},
+            "labels": labels,
+            "training_time": training_time,
+            "inference_time": inference_time,
+            "fps": float(len(test_texts) / inference_time) if inference_time > 0 else None,
+        }
     except Exception as exc:  # pragma: no cover - model availability is reported explicitly
         return {"model_id": model_name, "status": "model_unavailable", "notes": f"Could not initialize {model_id}: {exc}"}
 
