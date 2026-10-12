@@ -42,7 +42,24 @@ The benchmark implements the ten requested experiments:
 7. `distilbert`
 8. `mbert`
 9. `phobert`
-10. `phobert_nli_vi`
+10. `distilphobert`
+11. `phobert_nli_vi`
+
+`distilphobert` uses `trungbb8/distilphobert` and applies NFC/HTML/boilerplate
+normalization, conservative author removal, quality filtering, MD5 duplicate
+filtering, and VnCoreNLP word segmentation before fine-tuning. Install the
+`vncorenlp` package and download `VnCoreNLP-1.1.1.jar`, then set
+`VNCORENLP_JAR` or pass the path explicitly:
+
+```bash
+python -m src.experiments distilphobert \
+  --data-dir data \
+  --output-dir outputs \
+  --vncorenlp-jar /path/to/VnCoreNLP-1.1.1.jar
+```
+
+The run records preprocessing counts, class weights, mixed-precision status,
+training history, and the best checkpoint under `outputs/runs/distilphobert`.
 
 ## Experiment runner notebooks
 

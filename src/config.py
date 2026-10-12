@@ -42,6 +42,7 @@ EXPERIMENTS = {
     "distilbert": {"name": "DistilBERT fine-tuning", "trainable": True},
     "mbert": {"name": "mBERT fine-tuning", "trainable": True},
     "phobert": {"name": "PhoBERT fine-tuning", "trainable": True},
+    "distilphobert": {"name": "DistilPhoBERT fine-tuning", "trainable": True},
     "phobert_nli_vi": {"name": "PhoBERT-NLI-VI zero-shot", "trainable": False},
 }
 

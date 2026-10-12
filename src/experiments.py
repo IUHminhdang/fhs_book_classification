@@ -17,7 +17,11 @@ from sklearn.svm import LinearSVC
 
 from .config import EXPERIMENTS, RunConfig, TARGET_COLUMN
 from .data_validation import load_split_csv, validate_dataset
-from .text_utils import combine_text_fields, segment_vietnamese_text
+from .text_utils import (
+    combine_text_fields,
+    prepare_vncorenlp_records,
+    segment_vietnamese_text,
+)
 
 FASTTEXT_EPOCHS = 15
 RNN_EPOCHS = 10
@@ -93,6 +97,21 @@ def _class_weight_metadata(y_train: pd.Series, labels: list[str]) -> tuple[list[
     total = len(y_train)
     weights = [float(total / (len(labels) * max(int(counts.get(label, 0)), 1))) for label in labels]
     return weights, {label: int(counts.get(label, 0)) for label in labels}
+
+
+def _prepare_distilphobert_frame(
+    frame: pd.DataFrame,
+    jar_path: Optional[str] = None,
+) -> tuple[pd.DataFrame, dict[str, int]]:
+    raw_text = frame.apply(
+        lambda row: combine_text_fields(row.get("title", ""), row.get("description", "")),
+        axis=1,
+    )
+    prepared, stats = prepare_vncorenlp_records(raw_text.tolist(), jar_path=jar_path)
+    result = frame.copy()
+    result["text"] = prepared
+    valid = result["text"].astype(str).str.len().gt(0)
+    return result.loc[valid].reset_index(drop=True), stats
 
 
 def _run_tfidf_model(model_name: str, train_texts: pd.Series, val_texts: pd.Series, test_texts: pd.Series, y_train: pd.Series, y_val: pd.Series, y_test: pd.Series, labels: list[str]) -> Dict[str, Any]:
@@ -436,7 +455,13 @@ def _run_phobert_nli_vi(train_texts: pd.Series, val_texts: pd.Series, test_texts
 
 def _run_bert_family(model_name: str, train_texts: pd.Series, val_texts: pd.Series, test_texts: pd.Series, y_train: pd.Series, y_val: pd.Series, y_test: pd.Series, labels: list[str], model_id: str) -> Dict[str, Any]:
     try:
-        from transformers import AutoTokenizer, AutoModelForSequenceClassification, Trainer, TrainingArguments
+        from transformers import (
+            AutoModelForSequenceClassification,
+            AutoTokenizer,
+            EarlyStoppingCallback,
+            Trainer,
+            TrainingArguments,
+        )
         from torch.utils.data import Dataset
         import torch
     except Exception as exc:  # pragma: no cover
@@ -494,9 +519,11 @@ def _run_bert_family(model_name: str, train_texts: pd.Series, val_texts: pd.Seri
             logging_steps=50,
             load_best_model_at_end=True,
             metric_for_best_model="eval_loss",
+            greater_is_better=False,
             remove_unused_columns=False,
             report_to=[],
             disable_tqdm=False,
+            fp16=torch.cuda.is_available(),
         )
 
         def compute_metrics(eval_pred):
@@ -511,6 +538,7 @@ def _run_bert_family(model_name: str, train_texts: pd.Series, val_texts: pd.Seri
             train_dataset=train_encoded,
             eval_dataset=val_encoded,
             compute_metrics=compute_metrics,
+            callbacks=[EarlyStoppingCallback(early_stopping_patience=2)],
         )
         training_start = time.perf_counter()
         trainer.train()
@@ -551,7 +579,14 @@ def _run_bert_family(model_name: str, train_texts: pd.Series, val_texts: pd.Seri
         return {"model_id": model_name, "status": "model_unavailable", "notes": f"Could not initialize {model_id}: {exc}"}
 
 
-def run_experiment(experiment_id: str, data_dir: str | Path, output_dir: str | Path, seed: int = 42, resume: bool = False) -> Dict[str, Any]:
+def run_experiment(
+    experiment_id: str,
+    data_dir: str | Path,
+    output_dir: str | Path,
+    seed: int = 42,
+    resume: bool = False,
+    vncorenlp_jar: Optional[str] = None,
+) -> Dict[str, Any]:
     if experiment_id not in EXPERIMENTS:
         raise ValueError(f"Unknown experiment '{experiment_id}'. Available: {sorted(EXPERIMENTS)}")
 
@@ -565,9 +600,34 @@ def run_experiment(experiment_id: str, data_dir: str | Path, output_dir: str | P
     val_df = splits["val"].copy()
     test_df = splits["test"].copy()
 
-    train_df["text"] = _build_text_frame(train_df)
-    val_df["text"] = _build_text_frame(val_df)
-    test_df["text"] = _build_text_frame(test_df)
+    preprocessing_info: dict[str, Any] = {}
+    if experiment_id == "distilphobert":
+        try:
+            train_df, preprocessing_info["train"] = _prepare_distilphobert_frame(
+                train_df, jar_path=vncorenlp_jar
+            )
+            val_df, preprocessing_info["val"] = _prepare_distilphobert_frame(
+                val_df, jar_path=vncorenlp_jar
+            )
+            test_df, preprocessing_info["test"] = _prepare_distilphobert_frame(
+                test_df, jar_path=vncorenlp_jar
+            )
+        except RuntimeError as exc:
+            result = {
+                "model_id": "distilphobert",
+                "status": "preprocessing_unavailable",
+                "notes": str(exc),
+                "preprocessing": {"backend": "vncorenlp"},
+            }
+            train_df["text"] = _build_text_frame(train_df)
+            val_df["text"] = _build_text_frame(val_df)
+            test_df["text"] = _build_text_frame(test_df)
+        else:
+            preprocessing_info["backend"] = "vncorenlp"
+    else:
+        train_df["text"] = _build_text_frame(train_df)
+        val_df["text"] = _build_text_frame(val_df)
+        test_df["text"] = _build_text_frame(test_df)
 
     labels = sorted(train_df[TARGET_COLUMN].astype(str).unique().tolist())
     train_texts = train_df["text"]
@@ -577,8 +637,10 @@ def run_experiment(experiment_id: str, data_dir: str | Path, output_dir: str | P
     y_val = val_df[TARGET_COLUMN].astype(str)
     y_test = test_df[TARGET_COLUMN].astype(str)
 
-    result: Dict[str, Any] = {}
-    if experiment_id == "tfidf_lr":
+    result: Dict[str, Any] = locals().get("result", {})
+    if experiment_id == "distilphobert" and result.get("status") == "preprocessing_unavailable":
+        pass
+    elif experiment_id == "tfidf_lr":
         result = _run_tfidf_model("tfidf_lr", train_texts, val_texts, test_texts, y_train, y_val, y_test, labels)
     elif experiment_id == "tfidf_svm":
         result = _run_tfidf_model("tfidf_svm", train_texts, val_texts, test_texts, y_train, y_val, y_test, labels)
@@ -592,6 +654,18 @@ def run_experiment(experiment_id: str, data_dir: str | Path, output_dir: str | P
         result = _run_bert_family(experiment_id, train_texts, val_texts, test_texts, y_train, y_val, y_test, labels, "bert-base-multilingual-cased")
     elif experiment_id == "phobert":
         result = _run_bert_family(experiment_id, train_texts, val_texts, test_texts, y_train, y_val, y_test, labels, "vinai/phobert-base")
+    elif experiment_id == "distilphobert":
+        result = _run_bert_family(
+            experiment_id,
+            train_texts,
+            val_texts,
+            test_texts,
+            y_train,
+            y_val,
+            y_test,
+            labels,
+            "trungbb8/distilphobert",
+        )
     elif experiment_id == "phobert_nli_vi":
         result = _run_phobert_nli_vi(train_texts, val_texts, test_texts, y_train, y_val, y_test, labels)
     else:
@@ -603,6 +677,8 @@ def run_experiment(experiment_id: str, data_dir: str | Path, output_dir: str | P
     result["resume_supported"] = True
     result["notes"] = result.get("notes", "")
     result["input_columns"] = ["title", "description"]
+    if preprocessing_info:
+        result["preprocessing"] = preprocessing_info
     class_weights, class_counts = _class_weight_metadata(y_train, labels)
     result.setdefault("class_counts", class_counts)
     result.setdefault("class_weights", class_weights)
@@ -626,6 +702,12 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--output-dir", type=str, default="outputs")
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--resume", action="store_true")
+    parser.add_argument(
+        "--vncorenlp-jar",
+        type=str,
+        default=None,
+        help="Path to VnCoreNLP-1.1.1.jar for the DistilPhoBERT preprocessing path.",
+    )
     return parser
 
 
@@ -637,6 +719,7 @@ def main() -> None:
         output_dir=args.output_dir,
         seed=args.seed,
         resume=args.resume,
+        vncorenlp_jar=args.vncorenlp_jar,
     )
     print(json.dumps({"status": "ok", "experiment_id": result["experiment_id"], "output": str(Path(args.output_dir) / "results" / f"{args.experiment_id}.json")}, ensure_ascii=False, indent=2))
 
