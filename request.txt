@@ -1,0 +1,159 @@
+# TASK: Build Fahasa Book Genre Classification Benchmark
+
+Act as a senior Machine Learning Engineer. Inspect the current VS Code repository and implement a complete, runnable Python project for multi-class Vietnamese book genre classification using the Fahasa dataset.
+
+Write actual code, not pseudocode. Preserve existing useful code and do not overwrite the user's data or taxonomy.
+
+## 1. Dataset
+
+The source DataFrame `df_raw` contains these 22 columns:
+
+`title, description, price, author, thumbnail, product_code, supplier, translator, publisher, publish_year, language, weight_grams, num_pages, book_format, category_norm, language_norm, description_word_count, missing_description, series_name, volume_number, price_bucket, pages_bucket`
+
+The user has already created train, validation, and test splits. **Do not split the data again.**
+
+Expected files:
+
+* `data/train.csv`
+* `data/val.csv`
+* `data/test.csv`
+
+Allow the data directory to be configured for different environments.
+
+Use **only `title` and `description`** as model input for every experiment. Combine them consistently, handle missing values safely, and never include `author` or other metadata.
+
+Target: `category_norm`. Preserve the existing merged taxonomy exactly. Never silently remove, merge, or rename labels.
+
+Validate the schema, class distribution, missing values, and labels absent from validation/test before training.
+
+## 2. Implement exactly 10 experiments
+
+Implement all experiments so the user can select and run any one independently.
+
+1. `tfidf_lr`: Word + character TF-IDF + Logistic Regression.
+2. `tfidf_svm`: Word + character TF-IDF + LinearSVC.
+3. `fasttext_bilstm`: Vietnamese FastText embeddings + BiLSTM.
+4. `fasttext_bigru`: Vietnamese FastText embeddings + BiGRU.
+5. `minilm_lr`: `sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2` embeddings + Logistic Regression.
+6. `minilm_svm`: the same cached MiniLM embeddings + LinearSVC.
+7. `distilbert`: `distilbert-base-multilingual-cased` fine-tuning.
+8. `mbert`: `bert-base-multilingual-cased` fine-tuning.
+9. `phobert`: `vinai/phobert-base` fine-tuning.
+10. `phobert_nli_vi`: `lizNguyen235/phobert-nli-vi` zero-shot classification.
+
+For FastText experiments, use Vietnamese word segmentation with `underthesea` or a documented compatible segmenter before tokenization. Prefer compatible pretrained Vietnamese FastText vectors; if unavailable, support a clearly documented corpus-trained fallback. Never mislabel randomly initialized or corpus-trained vectors as pretrained.
+
+For MiniLM, encode the data once and reuse the same valid embedding cache for both classifiers.
+
+For PhoBERT-NLI-VI, verify the actual model architecture and model card before implementing the zero-shot scoring pipeline. Do not assume generic Hugging Face zero-shot compatibility. Do not fine-tune on Fahasa labels. If compatibility cannot be established, report the issue explicitly rather than silently substituting another model.
+
+Use consistent preprocessing and frozen splits for all experiments. Use validation Macro-F1 for supervised checkpoint selection. Include class-imbalance handling where appropriate.
+
+## 3. Repository and runners
+
+Create or adapt a clean project structure containing at least:
+
+* `src/`: data loading, preprocessing, models, training, evaluation, checkpointing, and aggregation.
+* `configs/`: shared configuration and label mapping.
+* `scripts/`: dataset audit, smoke tests, and report generation.
+* `notebooks/kaggle_runner.ipynb`
+* `notebooks/colab_runner.ipynb`
+* `tests/`
+* `requirements.txt`
+* `README.md`
+* `.gitignore`
+
+Implement both runner notebooks, but keep the actual training code in reusable Python modules.
+
+Each runner must let the user choose:
+
+* One experiment ID from the 10 experiments.
+* The data directory.
+* The output directory.
+* The configuration and seed.
+* Whether to resume a supported interrupted run.
+
+Do not automatically run all 10 experiments. The user will decide which experiment runs on Kaggle and which runs on either Colab account.
+
+Include clear instructions for developing in VS Code, pushing code to GitHub, pulling the repository into Kaggle/Colab, attaching the pre-split dataset, and exporting results.
+
+Save checkpoints and intermediate outputs safely. Support resuming interrupted runs where feasible. Never claim a run completed if it was interrupted.
+
+## 4. Evaluation metrics
+
+For every completed experiment, report:
+
+* Accuracy
+* Macro-F1
+* Weighted-F1
+* Micro-F1
+* Per-class precision, recall, F1, and support
+* Confusion matrix
+* Training time, where applicable
+* Inference time
+* **FPS (samples per second)**
+* Parameter count where applicable
+* Peak memory where measurable
+
+Define FPS consistently as the number of samples processed divided by inference time. Use batch inference where appropriate, exclude model-loading time, and document whether preprocessing is included. For GPU timing, synchronize CUDA around timed inference. Do not compare FPS values measured using inconsistent timing protocols.
+
+Save test predictions and test metrics after model selection. Never use test metrics to select checkpoints or tune hyperparameters.
+
+For zero-shot, report full-test metrics only if the full test set was evaluated. Clearly mark pilot-only or incomplete runs.
+
+## 5. CSV and downloadable charts — mandatory
+
+After experiments finish, or whenever the user requests report generation, aggregate all available completed experiment results.
+
+Create:
+
+`outputs/summary.csv`
+
+* One row per experiment.
+* Include model ID, input columns, seed, Accuracy, Macro-F1, Weighted-F1, Micro-F1, training time, inference time, FPS, parameter count, best epoch, and status where applicable.
+
+`outputs/per_class_comparison.csv`
+
+* Per-class precision, recall, F1, and support for each experiment.
+
+`outputs/training_history.csv`
+
+* Epoch-level loss and validation metrics for trainable models.
+
+`outputs/confusion_matrices/`
+
+* Confusion matrix data in CSV format for each completed experiment.
+
+`outputs/plots/`
+
+* `accuracy_comparison.png`
+* `macro_f1_comparison.png`
+* `weighted_f1_comparison.png`
+* `fps_comparison.png`
+* `training_time_comparison.png`
+* `inference_time_comparison.png`
+* `per_class_f1_heatmap.png`
+* `confusion_matrix_<experiment_id>.png` for each completed experiment with predictions.
+* `training_curves_<experiment_id>.png` for trainable models with recorded history.
+
+Generate plots using Matplotlib or Seaborn. Label axes, include readable experiment names, handle missing/incomplete experiments correctly, and use consistent units.
+
+Also generate `outputs/report.md` summarizing the best supervised model by validation Macro-F1, test metrics, FPS, class-wise weaknesses, and available experiment limitations. Do not select the winner using test Macro-F1.
+
+The user must be able to download the CSV and PNG files from Kaggle/Colab output directories. Document how to download individual files and how to package the reports into a ZIP file. Provide a script to generate a ZIP containing CSV files, PNG charts, and the Markdown report.
+
+Do not invent results for experiments that have not been run. Report missing results explicitly.
+
+## 6. Reproducibility and engineering
+
+* Use a fixed configurable seed, default 42.
+* Record package versions, model IDs, configuration, and split fingerprints.
+* Use atomic writes where practical.
+* Cache Vietnamese segmentation and sentence embeddings, validating cache fingerprints before reuse.
+* Keep datasets, credentials, large pretrained weights, caches, and generated artifacts out of Git.
+* Provide informative errors for missing columns, invalid labels, unavailable models, and incompatible dependencies.
+* Add unit tests and a small end-to-end smoke test.
+* Do not silently downgrade installed packages.
+* Do not claim tests passed unless they were actually executed.
+
+Start by inspecting the existing repository. Implement the project incrementally, run available tests, fix errors, and finish with exact commands to run each experiment, aggregate CSV results, generate charts, and create the downloadable ZIP archive.
