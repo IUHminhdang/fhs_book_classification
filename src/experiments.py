@@ -346,15 +346,34 @@ def _run_phobert_nli_vi(train_texts: pd.Series, val_texts: pd.Series, test_texts
     classifier = pipeline("zero-shot-classification", model=model_id, tokenizer=model_id, device=-1)
     candidate_labels = labels
     inference_start = time.perf_counter()
-    test_scores = [
-        classifier(text, candidate_labels, multi_label=False)
-        for text in tqdm(test_texts.astype(str), desc="Zero-shot test", unit="text")
-    ]
-    predicted = [pred["labels"][0] for pred in test_scores]
-    val_scores = [
-        classifier(text, candidate_labels, multi_label=False)
-        for text in tqdm(val_texts.astype(str), desc="Zero-shot validation", unit="text")
-    ]
+    try:
+        test_scores = [
+            classifier(
+                text,
+                candidate_labels,
+                multi_label=False,
+                truncation=True,
+                max_length=256,
+            )
+            for text in tqdm(test_texts.astype(str), desc="Zero-shot test", unit="text")
+        ]
+        predicted = [pred["labels"][0] for pred in test_scores]
+        val_scores = [
+            classifier(
+                text,
+                candidate_labels,
+                multi_label=False,
+                truncation=True,
+                max_length=256,
+            )
+            for text in tqdm(val_texts.astype(str), desc="Zero-shot validation", unit="text")
+        ]
+    except Exception as exc:
+        return {
+            "model_id": "phobert_nli_vi",
+            "status": "inference_failed",
+            "notes": f"Zero-shot inference failed after truncation to 256 tokens: {exc}",
+        }
     val_pred = [pred["labels"][0] for pred in val_scores]
     inference_time = time.perf_counter() - inference_start
     val_metrics = _compute_metrics(y_val.astype(str), pd.Series(val_pred), labels)
@@ -372,6 +391,7 @@ def _run_phobert_nli_vi(train_texts: pd.Series, val_texts: pd.Series, test_texts
 def _run_bert_family(model_name: str, train_texts: pd.Series, val_texts: pd.Series, test_texts: pd.Series, y_train: pd.Series, y_val: pd.Series, y_test: pd.Series, labels: list[str], model_id: str) -> Dict[str, Any]:
     try:
         from transformers import AutoTokenizer, AutoModelForSequenceClassification, Trainer, TrainingArguments
+        from torch.utils.data import Dataset
     except Exception as exc:  # pragma: no cover
         return {"model_id": model_name, "status": "dependency_missing", "notes": f"transformers unavailable: {exc}"}
 
@@ -379,17 +399,31 @@ def _run_bert_family(model_name: str, train_texts: pd.Series, val_texts: pd.Seri
         tokenizer = AutoTokenizer.from_pretrained(model_id)
         label_to_id = {label: idx for idx, label in enumerate(labels)}
         id_to_label = {idx: label for label, idx in label_to_id.items()}
-
-        def encode(batch_df: pd.DataFrame) -> Any:
-            encoded = tokenizer(batch_df["text"].tolist(), truncation=True, padding=True, max_length=256)
-            encoded["labels"] = [label_to_id[label] for label in batch_df[TARGET_COLUMN].tolist()]
-            return encoded
-
-        train_encoded = encode(pd.DataFrame({"text": train_texts.astype(str), TARGET_COLUMN: y_train.astype(str)}))
-        val_encoded = encode(pd.DataFrame({"text": val_texts.astype(str), TARGET_COLUMN: y_val.astype(str)}))
-        test_encoded = encode(pd.DataFrame({"text": test_texts.astype(str), TARGET_COLUMN: y_test.astype(str)}))
-
         model = AutoModelForSequenceClassification.from_pretrained(model_id, num_labels=len(labels), id2label=id_to_label, label2id=label_to_id)
+        model_limit = int(getattr(model.config, "max_position_embeddings", 256))
+        max_length = min(256, model_limit)
+
+        class EncodedTextDataset(Dataset):
+            def __init__(self, texts: pd.Series, targets: pd.Series) -> None:
+                self.encoded = tokenizer(
+                    texts.astype(str).tolist(),
+                    truncation=True,
+                    padding="max_length",
+                    max_length=max_length,
+                )
+                self.labels = [label_to_id[label] for label in targets.astype(str).tolist()]
+
+            def __len__(self) -> int:
+                return len(self.labels)
+
+            def __getitem__(self, index: int) -> dict[str, Any]:
+                item = {key: values[index] for key, values in self.encoded.items()}
+                item["labels"] = self.labels[index]
+                return item
+
+        train_encoded = EncodedTextDataset(train_texts, y_train)
+        val_encoded = EncodedTextDataset(val_texts, y_val)
+        test_encoded = EncodedTextDataset(test_texts, y_test)
         training_args = TrainingArguments(
             output_dir=str(Path("outputs") / "runs" / model_name),
             per_device_train_batch_size=4,
