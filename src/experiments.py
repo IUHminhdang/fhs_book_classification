@@ -8,6 +8,7 @@ from typing import Any, Dict, Optional
 
 import joblib
 import pandas as pd
+from tqdm.auto import tqdm
 from sklearn.feature_extraction.text import TfidfVectorizer
 from sklearn.linear_model import LogisticRegression
 from sklearn.metrics import accuracy_score, confusion_matrix, f1_score, precision_recall_fscore_support
@@ -92,9 +93,13 @@ def _run_tfidf_model(model_name: str, train_texts: pd.Series, val_texts: pd.Seri
         classifier = LinearSVC(C=1.0, class_weight="balanced")
 
     pipeline = Pipeline([("features", feature_union), ("clf", classifier)])
+    training_start = time.perf_counter()
     pipeline.fit(train_texts.astype(str), y_train.astype(str))
+    training_time = time.perf_counter() - training_start
+    inference_start = time.perf_counter()
     val_pred = pipeline.predict(val_texts.astype(str))
     test_pred = pipeline.predict(test_texts.astype(str))
+    inference_time = time.perf_counter() - inference_start
     val_metrics = _compute_metrics(y_val.astype(str), pd.Series(val_pred), labels)
     test_metrics = _compute_metrics(y_test.astype(str), pd.Series(test_pred), labels)
     return {
@@ -102,6 +107,9 @@ def _run_tfidf_model(model_name: str, train_texts: pd.Series, val_texts: pd.Seri
         "status": "completed",
         "metrics": {"val": val_metrics, "test": test_metrics},
         "labels": labels,
+        "training_time": training_time,
+        "inference_time": inference_time,
+        "fps": float(len(test_texts) / inference_time) if inference_time > 0 else None,
     }
 
 
@@ -129,12 +137,24 @@ def _run_minilm_model(model_name: str, train_texts: pd.Series, val_texts: pd.Ser
         joblib.dump({"train": train_emb, "val": val_emb, "test": test_emb}, cache_path)
 
     classifier = LogisticRegression(max_iter=2000, class_weight="balanced") if model_name == "minilm_lr" else LinearSVC(C=1.0, class_weight="balanced")
+    training_start = time.perf_counter()
     classifier.fit(train_emb, y_train.astype(str))
+    training_time = time.perf_counter() - training_start
+    inference_start = time.perf_counter()
     val_pred = classifier.predict(val_emb)
     test_pred = classifier.predict(test_emb)
+    inference_time = time.perf_counter() - inference_start
     val_metrics = _compute_metrics(y_val.astype(str), pd.Series(val_pred), labels)
     test_metrics = _compute_metrics(y_test.astype(str), pd.Series(test_pred), labels)
-    return {"model_id": model_name, "status": "completed", "metrics": {"val": val_metrics, "test": test_metrics}, "labels": labels}
+    return {
+        "model_id": model_name,
+        "status": "completed",
+        "metrics": {"val": val_metrics, "test": test_metrics},
+        "labels": labels,
+        "training_time": training_time,
+        "inference_time": inference_time,
+        "fps": float(len(test_texts) / inference_time) if inference_time > 0 else None,
+    }
 
 
 def _run_fasttext_model(model_name: str, train_texts: pd.Series, val_texts: pd.Series, test_texts: pd.Series, y_train: pd.Series, y_val: pd.Series, y_test: pd.Series, labels: list[str]) -> Dict[str, Any]:
@@ -143,40 +163,120 @@ def _run_fasttext_model(model_name: str, train_texts: pd.Series, val_texts: pd.S
     except Exception as exc:  # pragma: no cover - dependency missing
         return {"model_id": model_name, "status": "dependency_missing", "notes": f"gensim unavailable: {exc}"}
 
-    all_text = pd.concat([train_texts, val_texts, test_texts], ignore_index=True)
-    token_corpus = [segment_vietnamese_text(text).split() for text in all_text.astype(str)]
+    import numpy as np
+    import torch
+    from torch import nn
+    from torch.utils.data import DataLoader, TensorDataset
+
+    # Train the embedding vocabulary on the training split only. The two benchmark
+    # IDs differ in their recurrent classifier, not merely in their output name.
+    token_corpus = [segment_vietnamese_text(text).split() for text in train_texts.astype(str)]
     model = FastText(vector_size=100, window=5, min_count=2, workers=1, sg=1)
     model.build_vocab(token_corpus)
-    model.train(token_corpus, total_examples=len(token_corpus), epochs=10)
+    for _ in tqdm(range(10), desc="FastText training", unit="epoch"):
+        model.train(token_corpus, total_examples=len(token_corpus), epochs=1)
 
-    def embed_texts(texts: pd.Series) -> list[list[float]]:
-        vectors = []
-        for text in texts.astype(str):
-            tokens = segment_vietnamese_text(text).split()
-            if not tokens:
-                vectors.append([0.0] * 100)
-                continue
-            word_vectors = [model.wv[token] for token in tokens if token in model.wv]
-            if not word_vectors:
-                vectors.append([0.0] * 100)
-            else:
-                vectors.append([float(v) for v in sum(word_vectors) / len(word_vectors)])
-        return vectors
+    max_length = 128
 
-    X_train = embed_texts(train_texts)
-    X_val = embed_texts(val_texts)
-    X_test = embed_texts(test_texts)
+    def embed_sequences(texts: pd.Series) -> tuple[np.ndarray, np.ndarray]:
+        sequences = []
+        lengths = []
+        for text in tqdm(texts.astype(str), desc="Embedding texts", unit="text", leave=False):
+            tokens = segment_vietnamese_text(text).split()[:max_length]
+            vectors = [model.wv[token] for token in tokens] or [np.zeros(100, dtype=np.float32)]
+            sequences.append(np.asarray(vectors, dtype=np.float32))
+            lengths.append(min(len(tokens), max_length) or 1)
+        padded = np.zeros((len(sequences), max_length, 100), dtype=np.float32)
+        for idx, sequence in enumerate(sequences):
+            width = min(len(sequence), max_length)
+            padded[idx, :width] = sequence[:width]
+        return padded, np.asarray(lengths, dtype=np.int64)
 
-    import numpy as np
-    from sklearn.linear_model import LogisticRegression
+    X_train, lengths_train = embed_sequences(train_texts)
+    X_val, lengths_val = embed_sequences(val_texts)
+    X_test, lengths_test = embed_sequences(test_texts)
+    label_to_id = {label: idx for idx, label in enumerate(labels)}
 
-    clf = LogisticRegression(max_iter=2000, class_weight="balanced")
-    clf.fit(np.asarray(X_train), y_train.astype(str))
-    val_pred = clf.predict(np.asarray(X_val))
-    test_pred = clf.predict(np.asarray(X_test))
-    val_metrics = _compute_metrics(y_val.astype(str), pd.Series(val_pred), labels)
-    test_metrics = _compute_metrics(y_test.astype(str), pd.Series(test_pred), labels)
-    return {"model_id": model_name, "status": "completed", "metrics": {"val": val_metrics, "test": test_metrics}, "labels": labels}
+    class FastTextBiRNN(nn.Module):
+        def __init__(self, recurrent_type: str) -> None:
+            super().__init__()
+            recurrent = nn.LSTM if recurrent_type == "bilstm" else nn.GRU
+            self.rnn = recurrent(100, 128, batch_first=True, bidirectional=True, dropout=0.0)
+            self.dropout = nn.Dropout(0.2)
+            self.classifier = nn.Linear(256, len(labels))
+
+        def forward(self, inputs: torch.Tensor, lengths: torch.Tensor) -> torch.Tensor:
+            packed = nn.utils.rnn.pack_padded_sequence(
+                inputs, lengths.cpu(), batch_first=True, enforce_sorted=False
+            )
+            _, hidden = self.rnn(packed)
+            if isinstance(hidden, tuple):
+                hidden = hidden[0]
+            representation = torch.cat((hidden[-2], hidden[-1]), dim=1)
+            return self.classifier(self.dropout(representation))
+
+    recurrent_type = "bilstm" if model_name == "fasttext_bilstm" else "bigru"
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    classifier = FastTextBiRNN(recurrent_type).to(device)
+    train_dataset = TensorDataset(
+        torch.from_numpy(X_train),
+        torch.from_numpy(lengths_train),
+        torch.tensor([label_to_id[label] for label in y_train.astype(str)], dtype=torch.long),
+    )
+    val_dataset = TensorDataset(
+        torch.from_numpy(X_val),
+        torch.from_numpy(lengths_val),
+        torch.tensor([label_to_id[label] for label in y_val.astype(str)], dtype=torch.long),
+    )
+    test_dataset = TensorDataset(
+        torch.from_numpy(X_test),
+        torch.from_numpy(lengths_test),
+        torch.tensor([label_to_id[label] for label in y_test.astype(str)], dtype=torch.long),
+    )
+    loader = DataLoader(train_dataset, batch_size=64, shuffle=True)
+    criterion = nn.CrossEntropyLoss()
+    optimizer = torch.optim.Adam(classifier.parameters(), lr=1e-3)
+    training_start = time.perf_counter()
+
+    classifier.train()
+    for epoch in range(5):
+        progress = tqdm(loader, desc=f"{model_name} epoch {epoch + 1}/5", unit="batch")
+        for inputs, lengths, targets in progress:
+            inputs, lengths, targets = inputs.to(device), lengths.to(device), targets.to(device)
+            optimizer.zero_grad()
+            loss = criterion(classifier(inputs, lengths), targets)
+            loss.backward()
+            optimizer.step()
+            progress.set_postfix(loss=f"{loss.item():.4f}")
+    training_time = time.perf_counter() - training_start
+
+    def predict(dataset: TensorDataset) -> tuple[np.ndarray, float]:
+        loader = DataLoader(dataset, batch_size=128, shuffle=False)
+        predictions = []
+        start = time.perf_counter()
+        classifier.eval()
+        with torch.no_grad():
+            for inputs, lengths, _ in tqdm(loader, desc="Inference", unit="batch", leave=False):
+                logits = classifier(inputs.to(device), lengths.to(device))
+                predictions.extend(logits.argmax(dim=1).cpu().numpy().tolist())
+        return np.asarray(predictions), time.perf_counter() - start
+
+    val_pred, _ = predict(val_dataset)
+    test_pred, inference_time = predict(test_dataset)
+    val_metrics = _compute_metrics(y_val.astype(str), pd.Series([labels[idx] for idx in val_pred]), labels)
+    test_metrics = _compute_metrics(y_test.astype(str), pd.Series([labels[idx] for idx in test_pred]), labels)
+    return {
+        "model_id": model_name,
+        "architecture": recurrent_type,
+        "status": "completed",
+        "metrics": {"val": val_metrics, "test": test_metrics},
+        "labels": labels,
+        "training_time": training_time,
+        "inference_time": inference_time,
+        "fps": float(len(test_dataset) / inference_time) if inference_time > 0 else None,
+        "device": str(device),
+        "parameter_count": sum(parameter.numel() for parameter in classifier.parameters()),
+    }
 
 
 def _inspect_zero_shot_model(model_id: str) -> Dict[str, Any]:
@@ -222,13 +322,22 @@ def _run_phobert_nli_vi(train_texts: pd.Series, val_texts: pd.Series, test_texts
 
     classifier = pipeline("zero-shot-classification", model=model_id, tokenizer=model_id, device=-1)
     candidate_labels = labels
+    inference_start = time.perf_counter()
     test_scores = [classifier(text, candidate_labels, multi_label=False) for text in test_texts.astype(str).tolist()]
     predicted = [pred["labels"][0] for pred in test_scores]
     val_scores = [classifier(text, candidate_labels, multi_label=False) for text in val_texts.astype(str).tolist()]
     val_pred = [pred["labels"][0] for pred in val_scores]
+    inference_time = time.perf_counter() - inference_start
     val_metrics = _compute_metrics(y_val.astype(str), pd.Series(val_pred), labels)
     test_metrics = _compute_metrics(y_test.astype(str), pd.Series(predicted), labels)
-    return {"model_id": "phobert_nli_vi", "status": "completed", "metrics": {"val": val_metrics, "test": test_metrics}, "labels": labels}
+    return {
+        "model_id": "phobert_nli_vi",
+        "status": "completed",
+        "metrics": {"val": val_metrics, "test": test_metrics},
+        "labels": labels,
+        "inference_time": inference_time,
+        "fps": float(len(test_texts) / inference_time) if inference_time > 0 else None,
+    }
 
 
 def _run_bert_family(model_name: str, train_texts: pd.Series, val_texts: pd.Series, test_texts: pd.Series, y_train: pd.Series, y_val: pd.Series, y_test: pd.Series, labels: list[str], model_id: str) -> Dict[str, Any]:
