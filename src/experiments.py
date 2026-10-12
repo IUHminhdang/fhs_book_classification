@@ -237,17 +237,39 @@ def _run_fasttext_model(model_name: str, train_texts: pd.Series, val_texts: pd.S
     criterion = nn.CrossEntropyLoss()
     optimizer = torch.optim.Adam(classifier.parameters(), lr=1e-3)
     training_start = time.perf_counter()
+    history = []
 
     classifier.train()
     for epoch in range(5):
         progress = tqdm(loader, desc=f"{model_name} epoch {epoch + 1}/5", unit="batch")
+        epoch_loss = 0.0
+        batch_count = 0
         for inputs, lengths, targets in progress:
             inputs, lengths, targets = inputs.to(device), lengths.to(device), targets.to(device)
             optimizer.zero_grad()
             loss = criterion(classifier(inputs, lengths), targets)
             loss.backward()
             optimizer.step()
+            epoch_loss += loss.item()
+            batch_count += 1
             progress.set_postfix(loss=f"{loss.item():.4f}")
+        classifier.eval()
+        val_loss = 0.0
+        val_batches = 0
+        with torch.no_grad():
+            for inputs, lengths, targets in DataLoader(val_dataset, batch_size=128, shuffle=False):
+                val_loss += criterion(
+                    classifier(inputs.to(device), lengths.to(device)), targets.to(device)
+                ).item()
+                val_batches += 1
+        history.append(
+            {
+                "epoch": epoch + 1,
+                "loss": epoch_loss / max(batch_count, 1),
+                "val_loss": val_loss / max(val_batches, 1),
+            }
+        )
+        classifier.train()
     training_time = time.perf_counter() - training_start
 
     def predict(dataset: TensorDataset) -> tuple[np.ndarray, float]:
@@ -276,6 +298,7 @@ def _run_fasttext_model(model_name: str, train_texts: pd.Series, val_texts: pd.S
         "fps": float(len(test_dataset) / inference_time) if inference_time > 0 else None,
         "device": str(device),
         "parameter_count": sum(parameter.numel() for parameter in classifier.parameters()),
+        "history": history,
     }
 
 
@@ -406,6 +429,17 @@ def _run_bert_family(model_name: str, train_texts: pd.Series, val_texts: pd.Seri
         test_labels = y_test.astype(str).tolist()
         val_metrics = _compute_metrics(pd.Series(val_labels), pd.Series([id_to_label.get(int(v), str(v)) for v in val_pred]), labels)
         test_metrics = _compute_metrics(pd.Series(test_labels), pd.Series([id_to_label.get(int(v), str(v)) for v in test_pred]), labels)
+        history = []
+        for log_row in trainer.state.log_history:
+            if "loss" in log_row or "eval_loss" in log_row:
+                history.append(
+                    {
+                        "epoch": log_row.get("epoch"),
+                        "loss": log_row.get("loss"),
+                        "val_loss": log_row.get("eval_loss"),
+                        "val_accuracy": log_row.get("eval_accuracy"),
+                    }
+                )
         return {
             "model_id": model_name,
             "status": "completed",
@@ -414,6 +448,7 @@ def _run_bert_family(model_name: str, train_texts: pd.Series, val_texts: pd.Seri
             "training_time": training_time,
             "inference_time": inference_time,
             "fps": float(len(test_texts) / inference_time) if inference_time > 0 else None,
+            "history": history,
         }
     except Exception as exc:  # pragma: no cover - model availability is reported explicitly
         return {"model_id": model_name, "status": "model_unavailable", "notes": f"Could not initialize {model_id}: {exc}"}

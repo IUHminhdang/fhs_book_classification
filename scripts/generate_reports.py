@@ -66,6 +66,72 @@ def _write_confusion_matrices(results: list[dict], output_dir: Path) -> None:
         frame.to_csv(matrix_dir / f"{experiment_id}.csv", index=True)
 
 
+def _plot_confusion_matrices(results: list[dict], output_dir: Path) -> None:
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+    import seaborn as sns
+
+    plots_dir = output_dir / "plots" / "confusion_matrices"
+    plots_dir.mkdir(parents=True, exist_ok=True)
+    for result in results:
+        experiment_id = result.get("experiment_id", "unknown")
+        metrics = result.get("metrics", {})
+        test_metrics = metrics.get("test") or metrics.get("val") or {}
+        matrix = test_metrics.get("confusion_matrix")
+        labels = result.get("labels") or []
+        if not matrix:
+            continue
+        figure_width = max(8, min(24, len(labels) * 0.45))
+        plt.figure(figsize=(figure_width, figure_width * 0.8))
+        sns.heatmap(
+            matrix,
+            xticklabels=labels,
+            yticklabels=labels,
+            cmap="Blues",
+            annot=len(labels) <= 25,
+            fmt="d",
+            cbar=True,
+        )
+        plt.xlabel("Predicted label")
+        plt.ylabel("True label")
+        plt.title(f"{experiment_id} confusion matrix (test)")
+        plt.tight_layout()
+        plt.savefig(plots_dir / f"{experiment_id}.png", dpi=200)
+        plt.close()
+
+
+def _plot_training_history(results: list[dict], output_dir: Path) -> None:
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+
+    plots_dir = output_dir / "plots"
+    plots_dir.mkdir(parents=True, exist_ok=True)
+    for result in results:
+        history = result.get("history") or result.get("training_history") or []
+        rows = [
+            row for row in history
+            if row.get("loss") is not None or row.get("val_loss") is not None
+        ]
+        if not rows:
+            continue
+        epochs = [row.get("epoch", index + 1) for index, row in enumerate(rows)]
+        figure, axis = plt.subplots(figsize=(9, 5))
+        if any(row.get("loss") is not None for row in rows):
+            axis.plot(epochs, [row.get("loss") for row in rows], marker="o", label="Training loss")
+        if any(row.get("val_loss") is not None for row in rows):
+            axis.plot(epochs, [row.get("val_loss") for row in rows], marker="o", label="Validation loss")
+        axis.set_xlabel("Epoch")
+        axis.set_ylabel("Loss")
+        axis.set_title(f"{result.get('experiment_id', 'unknown')} loss curve")
+        axis.legend()
+        axis.grid(alpha=0.25)
+        figure.tight_layout()
+        figure.savefig(plots_dir / f"{result.get('experiment_id', 'unknown')}_loss.png", dpi=200)
+        plt.close(figure)
+
+
 def _plot_summary(summary: pd.DataFrame, output_dir: Path) -> None:
     import matplotlib
     matplotlib.use("Agg")
@@ -190,7 +256,9 @@ def main() -> None:
     pd.DataFrame(history_rows).to_csv(output_dir / "training_history.csv", index=False)
 
     _write_confusion_matrices(records, output_dir)
+    _plot_confusion_matrices(records, output_dir)
     _plot_summary(summary, output_dir)
+    _plot_training_history(records, output_dir)
     _write_report(summary, output_dir)
 
     if args.zip_output:
